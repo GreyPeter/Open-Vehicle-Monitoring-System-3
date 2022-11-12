@@ -39,6 +39,7 @@ class canformat_panda : public canformat
     virtual std::string get(CAN_log_message_t* message);
     virtual std::string getheader(struct timeval *time);
     virtual size_t put(CAN_log_message_t* message, uint8_t *buffer, size_t len, bool* hasmore, canlogconnection* clc=NULL);
+    std::string preferred_file_extension() { return ".panda.bin"; };
   };
 
 #endif // __CANFORMAT_PANDA_H__
