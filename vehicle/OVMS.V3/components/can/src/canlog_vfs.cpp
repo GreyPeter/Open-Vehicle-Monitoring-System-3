@@ -27,12 +27,16 @@
 #include "ovms_log.h"
 static const char *TAG = "canlog-vfs";
 
+#include <sys/stat.h>
 #include "can.h"
 #include "canformat.h"
 #include "canlog_vfs.h"
 #include "ovms_utils.h"
 #include "ovms_config.h"
+#include "ovms_nvs.h"
 #include "ovms_peripherals.h"
+
+static const char *CAN_PARAM = "can";
 
 void can_log_vfs_start(int verbosity, OvmsWriter* writer, OvmsCommand* cmd, int argc, const char* const* argv)
   {
@@ -52,6 +56,28 @@ void can_log_vfs_start(int verbosity, OvmsWriter* writer, OvmsCommand* cmd, int 
   else
     {
     writer->printf("Error: Could not start CAN logging to: %s\n", logger->GetInfo().c_str());
+    delete logger;
+    }
+  }
+
+void can_log_vfs_autostart(int verbosity, OvmsWriter* writer, OvmsCommand* cmd, int argc, const char* const* argv)
+  {
+  std::string format(cmd->GetName());
+  canlog_vfs* logger = new canlog_vfs_autonaming(argv[0],format);
+  logger->Open();
+
+  if (logger->IsOpen())
+    {
+    if (argc>1)
+      { MyCan.AddLogger(logger, argc-1, &argv[1]); }
+    else
+      { MyCan.AddLogger(logger); }
+    writer->printf("CAN logging to VFS with autonaming active: %s\n", logger->GetInfo().c_str());
+    MyCan.LogInfo(NULL, CAN_LogInfo_Config, logger->GetInfo().c_str());
+    }
+  else
+    {
+    writer->printf("Error: Could not start CAN logging with autonaming to: %s\n", logger->GetInfo().c_str());
     delete logger;
     }
   }
@@ -82,6 +108,15 @@ OvmsCanLogVFSInit::OvmsCanLogVFSInit()
           "Filter: <bus> | <id>[-<id>] | <bus>:<id>[-<id>]\n"
           "Example: 2:2a0-37f",
           1, 9);
+
+        OvmsCommand* autostart = cmd_can_log_start->RegisterCommand("vfs-auto", "CAN logging to VFS with autonaming (automatic file name)");
+        MyCanFormatFactory.RegisterCommandSet(autostart, "Start CAN logging to VFS with autonaming",
+          can_log_vfs_autostart,
+          "<naming prefix> [filter1] ... [filterN]\n"
+          "Filter: <bus> | <id>[-<id>] | <bus>:<id>[-<id>]\n"
+          "Example: 2:2a0-37f",
+          1, 9);
+
         }
       }
     }
@@ -268,4 +303,190 @@ void canlog_vfs::MountListener(std::string event, void* data)
     Close();
   else if (event == "sd.mounted" && startsWith(m_path, "/sd"))
     Open();
+  }
+
+static void replaceAll(std::string& str, const std::string& from, const std::string& to)
+  {
+  if(from.empty())
+    {
+    return;
+    }
+  size_t start_pos = 0;
+  while((start_pos = str.find(from, start_pos)) != std::string::npos)
+    {
+    str.replace(start_pos, from.length(), to);
+    start_pos += to.length(); // In case 'to' contains 'from', like replacing 'x' with 'yx'
+    }
+  }
+
+std::string canlog_vfs_autonaming::compute_log_file_name()
+  {
+  std::string path;
+
+  std::string vehicleid = MyConfig.GetParamValue("vehicle", "id", "OVMS");
+  char restarts[9];
+  uint64_t restart_count = MyNonVolatileStorage.GetRestartCount();
+  snprintf(restarts, sizeof(restarts), "%08lld", restart_count);
+
+  char splits[9];
+  snprintf(splits, sizeof(splits), "%08lld", m_file_nb_splits);
+
+  // Handle patterns replacements
+  path = m_file_name_pattern;
+  std::map<std::string, std::string>New_Map = {
+    {"{vehicleid}", vehicleid},
+    {"{session}", restarts},
+    {"{prefix}", m_prefix},
+    {"{splits}", splits},
+    {"{extension}", m_formatter->preferred_file_extension()},
+  };
+  for(auto x: New_Map)
+    {
+    replaceAll(path, x.first, x.second);
+    }
+
+  // Handle time-based replacements
+  time_t t = time(nullptr);
+  char replaced_path[PATH_MAX];
+  std::strftime(replaced_path, sizeof(replaced_path), path.c_str(), std::localtime(&t));
+  path = replaced_path;
+
+  // Remove consecutive slashes / dots;
+  for (auto i = 1; i < path.length(); /* erase shifts the pointer */ )
+    {
+    if ((path[i - 1] == path[i]) && ((path[i] == '/') || (path[i] == '.')))
+      {
+      path.erase(i, 1);
+      }
+    else
+      {
+      ++i;
+      }
+    }
+
+  // Creates directory hierarchy if necessary
+  // (Note: we always call mkdir, which will fail if the directory already exists)
+  if (path.length() > 1)
+    {
+    // We skip the first component which is the pseudo-mount point of the FS
+    size_t slashpos = path.find('/', 2);
+    if (path.length() > 1 + slashpos)
+      {
+      slashpos = path.find('/', 1 + slashpos);
+      for (size_t i = slashpos; i < path.length(); i = path.find('/', i+1))
+        {
+        // printf("%s\n", path.substr(0, i).c_str());
+        mkdir(path.substr(0, i).c_str(), 0);
+        }
+      }
+    }
+  return path;
+  }
+
+void canlog_vfs_autonaming::CycleLogfile()
+  {
+  if (!m_keep_empty_files && ((GetFileSize() == 0) || (m_msgcount == 0)))
+    {
+    ESP_LOGD(TAG, "File was empty, not changing the name");
+    }
+  else
+    {
+    m_file_nb_splits++;
+    std::string new_path = compute_log_file_name();
+    if (new_path != m_path)
+      {
+      bool was_open = m_isopen;
+      if (was_open)
+        {
+        Close();
+        m_msgcount = 0;
+        m_dropcount = 0;
+        m_filtercount = 0;
+        }
+      ESP_LOGD(TAG, "Changing file name from '%s' to '%s'", m_path.c_str(), new_path.c_str());
+      m_path = new_path;
+      if (was_open)
+        {
+        Open();
+        }
+      }
+    else
+      {
+      ESP_LOGD(TAG, "File name is unchanged");
+      }
+    }
+  }
+
+bool canlog_vfs_autonaming::Open()
+  {
+  m_logfile_start_time = esp_timer_get_time();
+  return canlog_vfs::Open();
+  }
+
+
+canlog_vfs_autonaming::canlog_vfs_autonaming(std::string prefix, std::string format)
+  : canlog_vfs("", format), m_prefix(prefix)
+  {
+  ReadConfig();
+  m_path = compute_log_file_name();
+  using std::placeholders::_1;
+  using std::placeholders::_2;
+  MyEvents.RegisterEvent(IDTAG, "config.mounted", std::bind(&canlog_vfs_autonaming::EventHandler, this, _1, _2));
+  MyEvents.RegisterEvent(IDTAG, "config.changed", std::bind(&canlog_vfs_autonaming::EventHandler, this, _1, _2));
+  MyEvents.RegisterEvent(IDTAG, "can.log.rotatefiles", std::bind(&canlog_vfs_autonaming::EventHandler, this, _1, _2));
+  }
+
+/**
+ * Load, or reload, the configuration if a config event occurred.
+ */
+void canlog_vfs_autonaming::EventHandler(std::string event, void* data)
+  {
+  if (event == "config.changed")
+    {
+    // Only reload if our parameter has changed
+    OvmsConfigParam* param = (OvmsConfigParam*)data;
+    if (param && param->GetName() == CAN_PARAM)
+      {
+      ReadConfig();
+      }
+    }
+  else if (event == "config.mounted")
+    {
+    ReadConfig();
+    }
+  else if (event == "can.log.rotatefiles")
+    {
+    CycleLogfile();
+    }
+  }
+
+/**
+ * Load, or reload, the configuration of log file (name templating, rotation, ...).
+ */
+void canlog_vfs_autonaming::ReadConfig()
+  {
+  m_keep_empty_files = MyConfig.GetParamValueBool(CAN_PARAM, "log.file.keep_empty", true);
+  m_logfile_max_size_kb = MyConfig.GetParamValueInt(CAN_PARAM, "log.file.maxsize_kb", 1024);
+  m_logfile_max_duration_s = MyConfig.GetParamValueInt(CAN_PARAM, "log.file.maxduration_s", 1800);
+  m_file_name_pattern = MyConfig.GetParamValue(CAN_PARAM, "log.file.pattern", "/sd/log/{vehicleid}/{session}/{prefix}/{splits}-%Y%m%d-%H%M%S{extension}");
+  }
+
+void canlog_vfs_autonaming::OutputMsg(CAN_log_message_t& msg)
+  {
+    size_t logfile_size = GetFileSize();
+    int64_t logfile_duration_s = (esp_timer_get_time() - m_logfile_start_time)/1000000;
+    ESP_LOGD(TAG, "canlog_vfs_autonaming::OutputMsg() size:%d, log duration: %llds", logfile_size, logfile_duration_s);
+    // We check the duration before logging (in case the messages are not so frequent,
+    // we can respect the max duration before logging)
+    if (m_logfile_max_duration_s &&  logfile_duration_s >= m_logfile_max_duration_s)
+      {
+      CycleLogfile();
+      }
+    canlog_vfs::OutputMsg(msg);
+    // We check the size after logging (in case the message we just wrote causes us
+    // to surpass the max size)
+    if (m_logfile_max_size_kb && logfile_size >= (m_logfile_max_size_kb*1024))
+      {
+      CycleLogfile();
+      }
   }

@@ -67,4 +67,62 @@ class canlog_vfs : public canlog
     std::string         m_path;
   };
 
+/**
+ * This class has the same target (VFS) than `canlog_vfs`, and adds the
+ * possibility of "cycling" the logs following some conditions. ("cycling" meaning
+ * that the log file will be closed ; and a new log file will be opened)
+ * The file can be cycled after:
+ * * a specific size has been reached (configuration item `[can] log.file.maxsize_kb`)
+ * * a specific duration of logs has been reached (configuration item `[can] log.file.maxduration_s`)
+ *
+ * An additional configuration item is introduced: `[can] log.file.keep_empty` where
+ * `true` will cycle the file name even if the file is empty (no messages logged),
+ * while `false` will prevent the cycling of an empty file - in order NOT to create
+ * files with a size of 0 (or having only their header written to storage)
+ *
+ * The file name pattern can also be configured with the configuration item
+ * `[can] log.file.pattern` which can be customized with some or part of the following
+ * parameters:
+ * * `{vehicleid}` will be replaced by the configured vehicle id
+ * * `{session}` will be replaced by the counter of restarts of the module (always incrementing)
+ * * `{prefix}` is an argument to the log command, so that you can configure multiple logs in parallel
+ * * `{splits}` is a counter of the number of cycles that occurred to this log file
+ * * `{extension}` is the preferred extension for the choosen log format
+ *
+ * Also in this pattern it's possible to use time-based conversion specifications
+ * from `strftime` like `%Y%m%d-%H%M%S`.
+ *
+ * This pattern can of course have multiple directories and subdirectories ; those will
+ * be created if necessary of the choosen VFS.
+ *
+ * Finally, a new event can be raised: `can.log.rotate_files` to force the rotation
+ * of the file name (while respecting the `[can] log.file.keep_empty` configuration item)
+ */
+class canlog_vfs_autonaming : public canlog_vfs
+  {
+  public:
+    canlog_vfs_autonaming(std::string prefix, std::string format);
+    virtual ~canlog_vfs_autonaming() {};
+
+  public:
+    virtual bool Open();
+    virtual void ReadConfig();
+    virtual void EventHandler(std::string event, void* data);
+    virtual void OutputMsg(CAN_log_message_t& msg);
+
+  protected:
+    virtual std::string compute_log_file_name();
+    virtual void CycleLogfile();
+
+  protected:
+    std::string         m_prefix;
+    std::string         m_file_name_pattern;
+    std::size_t         m_file_name_pattern_hash = 0;
+    uint64_t            m_file_nb_splits = 1;
+    bool                m_keep_empty_files = true;
+    size_t              m_logfile_max_size_kb = 0;
+    int64_t             m_logfile_start_time = 0;
+    size_t              m_logfile_max_duration_s = 0;
+  };
+
 #endif // __CANLOG_VFS_H__
